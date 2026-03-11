@@ -1,0 +1,967 @@
+---
+title: "EV Charging Network Customer Churn Prediction"
+subtitle: "Machine Learning Pipeline: EDA → Feature Engineering → Model Selection → Business Insights"
+author: "Shinyeong Kim"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    highlight-style: github
+    fig-align: center
+    embed-resources: true
+execute:
+  echo: true
+  message: false
+  warning: false
+  cache: false
+---
+
+## Project Overview
+
+**KoruCharge** is a fictional nationwide EV charging network in New Zealand. Following rapid network expansion, customer churn has increased across several regions, creating a need for more targeted retention strategies.
+
+The aim of this analysis is not only to predict churn accurately, but also to identify which customers should be prioritised for intervention and which operational issues contribute most strongly to retention risk.
+
+The analysis uses the full synthetic customer dataset and a broad feature set spanning six dimensions: customer profile, plan and payment, digital behaviour, charging experience, engagement signals, and geography. In addition to the original variables, several engineered features are created to capture compounding risk patterns that individual predictors alone may not fully represent.
+
+Three classification models are compared: **Logistic Regression**, **XGBoost**, and **LightGBM**. The best-performing model is selected automatically using **F-beta (β = 2)** as the primary criterion. This metric places greater weight on **Recall** than Precision, reflecting KoruCharge's asymmetric business cost structure: failing to identify a customer who is likely to churn is more costly than unnecessarily targeting a retained customer with a low-cost intervention.
+
+> *Why not AUC as the main selection metric?* AUC-ROC is still reported because it provides a useful threshold-independent view of discrimination. However, model selection in this project is based on F-beta (β = 2) because it is threshold-aware and more closely aligned with the operational objective of identifying customers for intervention.
+
+| Dimension | Features |
+|---|---|
+| Customer profile | `age`, `gender` |
+| Plan & payment | `plan_tier`, `payment_type`, `payment_failure_last4w`, `price_change_exposed` |
+| Digital behaviour | `device_os`, `app_version_lag_weeks`, `app_crashes_30d`, `notification_opt_in`, `email_opened_last` |
+| Charging experience | `charger_fault_rate`, `avg_wait_minutes`, `avg_kwh_per_session`, `peak_share`, `home_charging_access` |
+| Engagement signals | `satisfaction_survey`, `support_ticket`, `refund_request_last12w`, `weeks_since_signup`, `weeks_since_last_charge`, `charging_sessions_12w` |
+| Geography | `region` |
+
+---
+
+## Setup
+
+```{r setup}
+# ── Package management ──────────────────────────────────────────────────────
+# Set to TRUE on first run to install missing packages
+INSTALL_PACKAGES <- FALSE
+
+pkgs <- c(
+  "tidyverse", "tidymodels", "themis",       # core ML stack
+  "xgboost", "bonsai", "lightgbm",           # model engines: LR + XGBoost + LightGBM
+  "vip", "SHAPforxgboost",                   # interpretability
+  "ggridges", "patchwork",                   # visualisation
+  "knitr", "kableExtra", "scales",           # reporting
+  "car", "conflicted"                        # diagnostics
+)
+
+if (INSTALL_PACKAGES) {
+  new_pkgs <- pkgs[!pkgs %in% installed.packages()[, "Package"]]
+  if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages(lapply(pkgs, library, character.only = TRUE))
+
+# Resolve namespace conflicts explicitly
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("recode", "dplyr")
+conflict_prefer("spec",   "yardstick")
+
+# ── Global plot theme ───────────────────────────────────────────────────────
+# Consistent visual identity across all figures
+CHURN_COLS <- c("Churned" = "#E05C2A", "Retained" = "#2A7FBE")
+
+theme_koru <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title       = element_text(face = "bold", size = base_size + 2),
+      plot.subtitle    = element_text(colour = "grey40", size = base_size - 1),
+      axis.title       = element_text(colour = "grey30"),
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(face = "bold"),
+      legend.position  = "bottom"
+    )
+}
+
+theme_set(theme_koru())
+
+# ── Reproducibility ─────────────────────────────────────────────────────────
+set.seed(704)
+```
+
+---
+
+## 1. Data Ingestion & Cleaning
+
+```{r data-load}
+# ── Raw import ───────────────────────────────────────────────────────────────
+# Read CSV; empty strings treated as NA for consistent downstream handling
+raw <- read.csv(
+  "korucharge_customers.csv",
+  stringsAsFactors = FALSE,
+  na.strings       = c("", "NA")
+)
+
+cat(sprintf("Loaded: %d rows × %d columns\n", nrow(raw), ncol(raw)))
+```
+
+```{r data-clean}
+# ── Parsing helpers ──────────────────────────────────────────────────────────
+# strip_units(): removes measurement suffixes (kWh, mins, weeks, %) before coercion
+strip_units <- function(x) {
+  x <- trimws(as.character(x))
+  is_pct <- grepl("%$", x)
+  x[is_pct] <- as.character(
+    suppressWarnings(as.numeric(sub("%$", "", x[is_pct]))) / 100
+  )
+  x <- gsub("(?i)\\s*(kwh|mins?|weeks?|hours?)\\s*$", "", x, perl = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+# to_flag(): converts "TRUE"/"FALSE"/"Yes"/"No" strings to 0/1 integer flags
+to_flag <- function(x) {
+  lx <- tolower(trimws(as.character(x)))
+  case_when(
+    lx %in% c("true",  "yes", "1") ~ 1L,
+    lx %in% c("false", "no",  "0") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+# ── Feature engineering during cleaning ─────────────────────────────────────
+df <- raw |>
+  # 1. Parse string-encoded numerics
+  mutate(across(
+    c(avg_kwh_per_session, avg_wait_minutes, weeks_since_signup,
+      weeks_since_last_charge, charger_fault_rate, age,
+      app_crashes_30d, peak_share, charging_sessions_12w,
+      app_version_lag_weeks),
+    strip_units
+  )) |>
+  # 2. Encode satisfaction: "NoResponse" → 0 (disengagement signal, not missing data)
+  #    Confirmed by EDA: score-0 customers show above-average churn rates
+  mutate(
+    satisfaction_survey = strip_units(
+      if_else(trimws(as.character(satisfaction_survey)) == "NoResponse",
+              "0", as.character(satisfaction_survey))
+    )
+  ) |>
+  # 3. Convert boolean columns to binary flags
+  mutate(across(
+    c(notification_opt_in, email_opened_last, home_charging_access,
+      refund_request_last12w, price_change_exposed, payment_failure_last4w),
+    to_flag
+  )) |>
+  # 4. Factorise categoricals with meaningful level ordering
+  mutate(
+    plan_tier = factor(plan_tier, levels = c("Basic", "Plus", "Pro", "Fleet")),
+    support_ticket = factor(
+      trimws(support_ticket),
+      levels = c("NotLast3Months", "Last3Months", "YesThisMonth"),
+      ordered = TRUE
+    ),
+    region     = factor(region),
+    payment_type = factor(payment_type),
+    device_os    = factor(device_os),
+    # Consolidate sparse gender categories to reduce noise
+    gender = factor(
+      if_else(grepl("Prefer|Unknown|Other", gender, ignore.case = TRUE),
+              "Other", gender)
+    )
+  ) |>
+  # 5. Derived features - capturing compounding risk signals
+  #   fault_wait_index:   operational pain compounds when faults and queues occur together
+  #   crash_per_session:  raw app crashes matter less than instability relative to usage
+  #   recency_bucket:     converts continuous inactivity into interpretable business segments
+  mutate(
+    # Combined service quality index: fault × wait interaction
+    fault_wait_index = charger_fault_rate * avg_wait_minutes,
+    # Digital friction: app instability relative to usage volume
+    crash_per_session = if_else(
+      charging_sessions_12w > 0,
+      app_crashes_30d / charging_sessions_12w, 
+      app_crashes_30d
+    ),
+    # Engagement recency bucket (coarse, for interpretability)
+    recency_bucket = cut(
+      weeks_since_last_charge,
+      breaks = c(-Inf, 2, 4, 8, Inf),
+      labels = c("Active", "Recent", "Drifting", "Inactive"),
+      right  = TRUE
+    )
+  ) |>
+  # 6. Target variable: factor with Churned as the positive (event) class
+  mutate(
+    churn = factor(
+      if_else(retained_binary == 0, "Churned", "Retained"),
+      levels = c("Churned", "Retained")
+    )
+  ) |>
+  # Drop identifiers and raw target
+  select(-user_ID, -retained_binary)
+
+# ── Impute residual NAs (median / mode) ─────────────────────────────────────
+# Apply after parsing to catch any conversion artefacts
+for (col in names(df)) {
+  if (sum(is.na(df[[col]])) == 0) next
+  if (is.numeric(df[[col]])) {
+    df[[col]][is.na(df[[col]])] <- median(df[[col]], na.rm = TRUE)
+  } else {
+    mode_val <- names(sort(table(df[[col]]), decreasing = TRUE))[1]
+    df[[col]][is.na(df[[col]])] <- mode_val
+  }
+}
+
+cat(sprintf(
+  "Clean dataset: %d rows × %d columns | Churn rate: %.1f%%\n",
+  nrow(df), ncol(df),
+  mean(df$churn == "Churned") * 100
+))
+```
+
+---
+
+## 2. Exploratory Data Analysis
+
+### 2.1 Target Distribution
+
+Overall churn rate is approximately 30.5%, meaning roughly 1 in 3 customers left the network. This moderate class imbalance is addressed during preprocessing via upsampling to ensure the model does not simply default to predicting "Retained" for every customer.
+
+```{r eda-target}
+# ── Overall churn rate ───────────────────────────────────────────────────────
+p_overall <- df |>
+  count(churn) |>
+  mutate(pct = n / sum(n)) |>
+  ggplot(aes(x = churn, y = n, fill = churn)) +
+  geom_col(width = 0.55, show.legend = FALSE) +
+  geom_text(
+    aes(label = paste0(comma(n), "\n(", percent(pct, accuracy = 0.1), ")")),
+    vjust = -0.4, size = 3.8, fontface = "bold"
+  ) +
+  scale_fill_manual(values = CHURN_COLS) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title    = "Overall Churn Distribution",
+    subtitle = "30.5% churn rate - moderate class imbalance handled via upsampling",
+    x = NULL, y = "Customer count"
+  )
+
+p_overall
+```
+
+### 2.2 Satisfaction Survey & Recency
+
+Satisfaction scores 1 and 2 show the highest churn rates (above 60%), making them the most immediately actionable risk signals. Notably, non-respondents (score 0, ~52% of customers) churn at the overall average rate - this is treated as a disengagement signal rather than missing data. For recency, customers inactive for 8 or more weeks churn at dramatically higher rates than active users, which directly motivates `weeks_since_last_charge` as a key feature.
+
+```{r eda-satisfaction}
+# ── Churn rate by satisfaction score ────────────────────────────────────────
+# Score 0 = no response; treated as disengagement, not missing data
+avg_churn <- mean(df$churn == "Churned")
+
+p_sat <- df |>
+  mutate(sat_label = factor(
+    if_else(satisfaction_survey == 0, "0\n(No response)",
+            as.character(satisfaction_survey)),
+    levels = c("0\n(No response)", "1", "2", "3", "4", "5")
+  )) |>
+  count(sat_label, churn) |>
+  group_by(sat_label) |>
+  mutate(rate = n / sum(n)) |>
+  filter(churn == "Churned") |>
+  mutate(vs_avg = if_else(rate > avg_churn, "Above avg", "Below avg")) |>
+  ggplot(aes(x = sat_label, y = rate, fill = vs_avg)) +
+  geom_col(show.legend = TRUE) +
+  geom_hline(yintercept = avg_churn, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.6, y = avg_churn + 0.02,
+           label = "Avg", size = 3, colour = "grey40") +
+  scale_fill_manual(values = c("Above avg" = "#E05C2A", "Below avg" = "#2A7FBE"),
+                    name = NULL) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 0.8)) +
+  labs(
+    title    = "Churn Rate by Satisfaction Score",
+    subtitle = "Scores 1–2 are critical: >60% churn. Non-responders also at-risk.",
+    x = "Satisfaction score", y = "Churn rate"
+  )
+
+# ── Churn rate by recency bucket ─────────────────────────────────────────────
+p_recency <- df |>
+  count(recency_bucket, churn) |>
+  group_by(recency_bucket) |>
+  mutate(rate = n / sum(n)) |>
+  filter(churn == "Churned") |>
+  ggplot(aes(x = recency_bucket, y = rate, fill = recency_bucket)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(rate, accuracy = 1)),
+            vjust = -0.4, fontface = "bold", size = 3.5) +
+  scale_fill_manual(values = c(
+    "Active"   = "#2A7FBE",
+    "Recent"   = "#6BAED6",
+    "Drifting" = "#FDAE6B",
+    "Inactive" = "#E05C2A"
+  )) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Churn Rate by Recency Bucket",
+    subtitle = "Inactive customers (8+ weeks) churn at dramatically higher rates",
+    x = "Last charge recency", y = "Churn rate"
+  )
+
+p_sat / p_recency
+```
+
+### 2.3 Commercial & Operational Risk Factors
+
+A single payment failure in the past 4 weeks more than doubles churn risk (approximately 63% vs. 28% baseline), making it the most time-sensitive trigger for intervention. Plan tier also shows a clear gradient: Basic plan customers churn at the highest rate, likely because they have less invested in the service and face lower switching costs compared to Pro or Fleet members.
+
+```{r eda-commercial}
+# ── Churn by payment failure and plan tier ───────────────────────────────────
+p_payment <- df |>
+  mutate(failed = if_else(payment_failure_last4w == 1, "Payment\nfailed", "No\nfailure")) |>
+  count(failed, churn) |>
+  group_by(failed) |>
+  mutate(rate = n / sum(n)) |>
+  filter(churn == "Churned") |>
+  ggplot(aes(x = failed, y = rate, fill = failed)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = percent(rate, accuracy = 1)),
+            vjust = -0.4, fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Payment\nfailed" = "#E05C2A", "No\nfailure" = "#2A7FBE")) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 0.75)) +
+  labs(title = "Payment Failure", subtitle = "2× churn risk",
+       x = NULL, y = "Churn rate")
+
+p_plan <- df |>
+  count(plan_tier, churn) |>
+  group_by(plan_tier) |>
+  mutate(rate = n / sum(n)) |>
+  filter(churn == "Churned") |>
+  ggplot(aes(x = plan_tier, y = rate, fill = plan_tier)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = percent(rate, accuracy = 1)),
+            vjust = -0.4, fontface = "bold", size = 3.5) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 0.45)) +
+  scale_fill_brewer(palette = "Blues", direction = -1) +
+  labs(title = "Plan Tier", subtitle = "Basic plans churn most",
+       x = NULL, y = "Churn rate")
+
+p_payment | p_plan
+```
+
+### 2.4 Regional Churn Heatmap
+
+Churn rates vary substantially across New Zealand regions. West Coast, Southland, and Otago sit well above the national average, potentially reflecting regional differences in infrastructure availability or service quality. However, as the modelling results will show, regional effects are relatively weak compared to individual behavioural signals - meaning churn is driven more by how customers use the service than where they are located.
+
+```{r eda-region}
+# ── Churn rate by NZ region, ranked ─────────────────────────────────────────
+df |>
+  count(region, churn) |>
+  group_by(region) |>
+  mutate(
+    total     = sum(n),
+    churn_rate = n / total
+  ) |>
+  filter(churn == "Churned") |>
+  mutate(vs_avg = if_else(churn_rate > avg_churn, "Above avg", "Below avg")) |>
+  ggplot(aes(x = reorder(region, churn_rate), y = churn_rate, fill = vs_avg)) +
+  geom_col(show.legend = TRUE) +
+  geom_hline(yintercept = avg_churn, linetype = "dashed", colour = "grey50") +
+  scale_fill_manual(values = c("Above avg" = "#E05C2A", "Below avg" = "#2A7FBE"),
+                    name = NULL) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  coord_flip() +
+  labs(
+    title    = "Churn Rate by Region",
+    subtitle = "West Coast, Southland, Otago consistently above national average",
+    x = NULL, y = "Churn rate"
+  )
+```
+
+### 2.5 Numeric Predictor Distributions
+
+Across all six key numeric features, churned and retained customers show clearly separated distributions. Churned customers tend to have longer inactivity periods, lower satisfaction scores, longer wait times, higher fault rates, fewer charging sessions, and more app crashes. The separation is most pronounced for `weeks_since_last_charge` and `satisfaction_survey`, which aligns with their high variable importance in the final model.
+
+```{r eda-distributions}
+#| fig-height: 7
+
+# ── Ridge plots: distribution shape by churn status for key numeric features ──
+key_numeric <- c(
+  "weeks_since_last_charge", "satisfaction_survey",
+  "avg_wait_minutes", "charger_fault_rate",
+  "charging_sessions_12w", "app_crashes_30d"
+)
+
+labels_map <- c(
+  weeks_since_last_charge = "Weeks since last charge",
+  satisfaction_survey     = "Satisfaction score",
+  avg_wait_minutes        = "Avg wait (mins)",
+  charger_fault_rate      = "Charger fault rate",
+  charging_sessions_12w   = "Sessions (12 weeks)",
+  app_crashes_30d         = "App crashes (30 days)"
+)
+
+df |>
+  select(churn, all_of(key_numeric)) |>
+  pivot_longer(-churn, names_to = "variable", values_to = "value") |>
+  mutate(variable = factor(recode(variable, !!!labels_map),
+                           levels = labels_map)) |>
+  ggplot(aes(x = value, y = churn, fill = churn)) +
+  ggridges::geom_density_ridges(alpha = 0.75, scale = 0.9,
+                                  rel_min_height = 0.01) +
+  scale_fill_manual(values = CHURN_COLS, guide = "none") +
+  facet_wrap(~variable, scales = "free_x", ncol = 2) +
+  labs(
+    title    = "Predictor Distributions by Churn Status",
+    subtitle = "Churned customers show longer inactivity, lower satisfaction, higher waits",
+    x = NULL, y = NULL
+  )
+```
+
+### 2.6 Interaction Effect: Fault Rate × Wait Time
+
+When charger fault rate and wait time are both high, churn risk is far greater than either factor alone - a compounding effect. This suggests customers tolerate one bad experience but are much more likely to leave after a visit where both the charger was faulty and the wait was long. This finding directly motivates the engineered feature `fault_wait_index` (fault rate × wait time), which later appears among the top features in the final model's importance ranking.
+
+```{r eda-interaction}
+# ── The combined effect of fault rate and wait time on churn ─────────────────
+# This interaction motivates the engineered `fault_wait_index` feature
+df |>
+  mutate(
+    fault_grp = if_else(charger_fault_rate > median(charger_fault_rate),
+                        "High fault rate", "Low fault rate"),
+    wait_grp  = if_else(avg_wait_minutes > median(avg_wait_minutes),
+                        "Long wait (>median)", "Short wait (≤median)")
+  ) |>
+  count(fault_grp, wait_grp, churn) |>
+  group_by(fault_grp, wait_grp) |>
+  mutate(rate = n / sum(n)) |>
+  filter(churn == "Churned") |>
+  ggplot(aes(x = wait_grp, y = rate, fill = fault_grp)) +
+  geom_col(position = position_dodge(0.75), width = 0.65) +
+  geom_text(
+    aes(label = percent(rate, accuracy = 1)),
+    position = position_dodge(0.75), vjust = -0.4, size = 3.5
+  ) +
+  scale_fill_manual(values = c("High fault rate" = "#E05C2A",
+                                "Low fault rate"  = "#2A7FBE"),
+                    name = "Fault rate") +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 0.5)) +
+  labs(
+    title    = "Churn Rate: Wait Time × Fault Rate Interaction",
+    subtitle = "Compounding effect - high fault + long wait nearly doubles churn vs. either alone",
+    x = NULL, y = "Churn rate"
+  )
+```
+
+---
+
+## 3. Modelling
+
+### 3.1 Train / Test Split & Cross-Validation
+
+The dataset is split 80/20 into training and test sets, stratified on churn status to preserve the 30.5% churn rate in both partitions. The test set is held out entirely and only used for final evaluation - no model selection decisions are made based on it. Model comparison is done using 5-fold cross-validation on the training set.
+
+```{r split}
+# ── 80/20 stratified split ───────────────────────────────────────────────────
+# Stratified on churn to preserve class ratio in both partitions
+koru_split <- initial_split(df, prop = 0.80, strata = churn)
+train_data  <- training(koru_split)
+test_data   <- testing(koru_split)
+
+# 5-fold CV on training set, stratified
+cv_folds <- vfold_cv(train_data, v = 5, strata = churn)
+
+cat(sprintf(
+  "Train: %d rows | Test: %d rows | Folds: 5\n",
+  nrow(train_data), nrow(test_data)
+))
+```
+
+### 3.2 Preprocessing Recipe
+
+All three models share an identical preprocessing recipe to ensure a fair comparison. The key steps are ordinal encoding for `support_ticket` (preserving its natural order), dummy encoding for remaining categorical variables, normalisation for numeric predictors, and upsampling the minority class to a 1:1 ratio to address the 30.5% class imbalance.
+
+```{r recipe}
+# ── Single shared recipe ─────────────────────────────────────────────────────
+# All models use identical preprocessing for a fair comparison.
+# Steps in logical order:
+#   1. Impute (safety net - data is already clean)
+#   2. Encode ordered factor (support_ticket ordinal scores)
+#   3. Dummy encode all remaining nominal predictors
+#   4. Remove zero-variance predictors (post-encoding artefacts)
+#   5. Normalise numeric predictors (mean=0, sd=1)
+#   6. Upsample minority class (Churned) to 1:1 ratio
+
+koru_recipe <- recipe(churn ~ ., data = train_data) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_ordinalscore(support_ticket) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_upsample(churn, over_ratio = 1, seed = 704)
+
+# Sanity check: preview the baked training data
+baked_preview <- koru_recipe |> prep() |> bake(new_data = NULL)
+cat(sprintf("Baked training set: %d rows × %d columns\n",
+            nrow(baked_preview), ncol(baked_preview)))
+```
+
+### 3.3 Model Definitions
+
+Three models are compared in order to balance predictive performance with interpretability.
+
+Logistic Regression is included as an interpretable baseline. It provides directly explainable coefficients and odds ratios, making it useful for translating model results into business language.
+
+XGBoost is included as a high-performing gradient boosting model that can capture non-linear relationships and interactions more flexibly than linear methods. It also supports SHAP-based interpretation, which helps explain how individual features influence predictions.
+
+LightGBM is included as a benchmark against the strongest model from the earlier team project. Its leaf-wise boosting approach often performs competitively on structured tabular data and provides a useful comparison against XGBoost.
+
+All three models use the same preprocessing recipe to ensure a fair comparison.
+
+```{r models}
+# ── Evaluation metric set ────────────────────────────────────────────────────
+# Primary selection criterion: F-beta (β=2)
+#   - Weights Recall twice as heavily as Precision
+#   - Rationale: missing a churner (lost LTV) costs more than a false alarm
+#     (small intervention cost). β=2 reflects this asymmetry without ignoring
+#     Precision entirely (unlike raw Sensitivity which rewards "predict all churn").
+#
+# All other metrics reported for full transparency.
+# "Churned" is the positive class (event_level = "first")
+
+f_beta2 <- metric_tweak("f_beta2", f_meas, beta = 2, event_level = "first")
+
+eval_metrics <- metric_set(
+  f_beta2,
+  metric_tweak("roc_auc", roc_auc, event_level = "first"),
+  metric_tweak("sens",    sens,    event_level = "first"),
+  metric_tweak("spec",    spec,    event_level = "first"),
+  metric_tweak("f1",      f_meas,  event_level = "first"),
+  accuracy
+)
+
+# ── Model 1: Logistic Regression ─────────────────────────────────────────────
+# Interpretable baseline; Odds Ratios give direct business language
+lr_spec <- logistic_reg() |> set_engine("glm")
+
+lr_wf <- workflow() |>
+  add_recipe(koru_recipe) |>
+  add_model(lr_spec)
+
+# ── Model 2: XGBoost ─────────────────────────────────────────────────────────
+# Level-wise boosting; supports SHAP-based feature attribution
+xgb_spec <- boost_tree(
+  trees          = 500,
+  tree_depth     = 6,
+  learn_rate     = 0.05,
+  loss_reduction = 0.01,
+  min_n          = 10
+) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+xgb_wf <- workflow() |>
+  add_recipe(koru_recipe) |>
+  add_model(xgb_spec)
+
+# ── Model 3: LightGBM ────────────────────────────────────────────────────────
+# Leaf-wise boosting; the team's best model - included to benchmark directly
+lgbm_spec <- boost_tree(trees = 500, min_n = 100) |>
+  set_engine("lightgbm") |>
+  set_mode("classification")
+
+lgbm_wf <- workflow() |>
+  add_recipe(koru_recipe) |>
+  add_model(lgbm_spec)
+```
+
+### 3.4 Cross-Validation
+
+XGBoost ranks first on F-beta2 (0.8747) and Recall (0.8990), with LightGBM close behind. Logistic Regression trails on both metrics but remains a useful interpretable baseline.
+
+```{r cv-fit}
+#| cache: true
+
+# ── Fit all three models via 5-fold CV ───────────────────────────────────────
+cv_ctrl <- control_resamples(save_pred = TRUE)
+
+lr_cv   <- fit_resamples(lr_wf,   cv_folds, metrics = eval_metrics, control = cv_ctrl)
+xgb_cv  <- fit_resamples(xgb_wf,  cv_folds, metrics = eval_metrics, control = cv_ctrl)
+lgbm_cv <- fit_resamples(lgbm_wf, cv_folds, metrics = eval_metrics, control = cv_ctrl)
+```
+
+```{r cv-results}
+# ── Collect and rank CV results ──────────────────────────────────────────────
+cv_results <- bind_rows(
+  collect_metrics(lr_cv)   |> mutate(model = "Logistic Regression"),
+  collect_metrics(xgb_cv)  |> mutate(model = "XGBoost"),
+  collect_metrics(lgbm_cv) |> mutate(model = "LightGBM")
+) |>
+  filter(.metric %in% c("f_beta2", "roc_auc", "f1", "sens", "spec", "accuracy")) |>
+  select(model, .metric, mean, std_err) |>
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err))
+
+# ── Summary table ranked by F-beta2 (primary selection criterion) ────────────
+cv_results |>
+  select(
+    Model    = model,
+    `F2 ★`  = mean_f_beta2,   # primary selection criterion
+    Recall   = mean_sens,
+    AUC      = mean_roc_auc,
+    F1       = mean_f1,
+    Accuracy = mean_accuracy,
+    Spec     = mean_spec
+  ) |>
+  arrange(desc(`F2 ★`)) |>
+  knitr::kable(
+    caption = "Cross-Validation Performance (Mean Across 5 Folds) - ranked by F-beta2",
+    digits  = 4,
+    booktabs = TRUE
+  ) |>
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = "striped") |>
+  kableExtra::row_spec(1, bold = TRUE, background = "#D4E6F1") |>
+  kableExtra::add_footnote(
+    "★ F-beta2 (β=2): primary criterion. Recall weighted 2× over Precision to reflect asymmetric churn intervention costs.",
+    notation = "none"
+  )
+```
+
+```{r cv-plot}
+# ── Visual comparison ────────────────────────────────────────────────────────
+cv_long <- bind_rows(
+  collect_metrics(lr_cv)   |> mutate(model = "Logistic Regression"),
+  collect_metrics(xgb_cv)  |> mutate(model = "XGBoost"),
+  collect_metrics(lgbm_cv) |> mutate(model = "LightGBM")
+) |>
+  filter(.metric %in% c("f_beta2", "roc_auc", "sens", "spec")) |>
+  mutate(.metric = recode(.metric,
+    "f_beta2" = "F-beta2 ★ (primary)",
+    "roc_auc" = "AUC-ROC",
+    "sens"    = "Recall (Sensitivity)",
+    "spec"    = "Specificity"
+  ))
+
+ggplot(cv_long, aes(x = reorder(model, mean), y = mean, colour = model)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err),
+                width = 0.2) +
+  facet_wrap(~.metric, scales = "free_y", nrow = 2) +
+  scale_colour_manual(values = c(
+    "Logistic Regression" = "#6BAED6",
+    "XGBoost"             = "#E05C2A",
+    "LightGBM"            = "#41AB5D"
+  ), guide = "none") +
+  coord_flip() +
+  labs(
+    title    = "Model Comparison: 5-Fold CV Metrics",
+    subtitle = "★ F-beta2 is the primary selection criterion | Error bars = ±1 SE",
+    x = NULL, y = "Mean metric value"
+  )
+```
+
+### 3.5 Best Model Selection & Final Evaluation
+
+XGBoost is selected as the best model based on cross-validated F-beta2. Results on the held-out test set are shown below. The high AUC-PR (0.9318) is particularly meaningful under class imbalance, confirming strong performance on the minority Churned class specifically.
+
+```{r best-model-select}
+# ── Automatically select the model with highest mean F-beta2 ──────────────────
+# F-beta2 is our primary criterion: Recall-weighted, threshold-aware,
+# appropriate for asymmetric intervention costs.
+fb2_summary <- bind_rows(
+  collect_metrics(lr_cv)   |> mutate(model = "lr"),
+  collect_metrics(xgb_cv)  |> mutate(model = "xgb"),
+  collect_metrics(lgbm_cv) |> mutate(model = "lgbm")
+) |>
+  filter(.metric == "f_beta2") |>
+  slice_max(mean, n = 1)
+
+best_model_name <- fb2_summary$model
+cat(sprintf(
+  "Best model by F-beta2 (β=2): %s  |  F2 = %.4f  |  Recall = %.4f\n",
+  best_model_name,
+  fb2_summary$mean,
+  bind_rows(
+    collect_metrics(lr_cv)   |> mutate(model = "lr"),
+    collect_metrics(xgb_cv)  |> mutate(model = "xgb"),
+    collect_metrics(lgbm_cv) |> mutate(model = "lgbm")
+  ) |> filter(.metric == "sens", model == best_model_name) |> pull(mean)
+))
+
+# Map model name to its workflow
+best_wf <- switch(best_model_name,
+  "lr"   = lr_wf,
+  "xgb"  = xgb_wf,
+  "lgbm" = lgbm_wf
+)
+```
+
+```{r final-fit}
+# ── Final fit: train on full training set, evaluate on held-out test set ──────
+final_fit <- best_wf |> last_fit(koru_split, metrics = eval_metrics)
+
+final_metrics <- collect_metrics(final_fit)
+final_preds   <- collect_predictions(final_fit)
+
+# ── AUC-PR: computed separately (not in eval_metrics set) ────────────────────
+# Included here alongside AUC-ROC to give a complete picture of model quality
+pr_auc_row <- final_preds |>
+  pr_auc(truth = churn, .pred_Churned, event_level = "first") |>
+  mutate(.metric = "pr_auc")
+
+# ── Test set performance table ────────────────────────────────────────────────
+final_metrics |>
+  filter(.metric %in% c("f_beta2", "sens", "roc_auc", "f1", "accuracy", "spec")) |>
+  bind_rows(pr_auc_row |> select(.metric, .estimate)) |>
+  mutate(Metric = recode(.metric,
+    "f_beta2"  = "F-beta2 ★ (primary)",
+    "sens"     = "Recall (Sensitivity)",
+    "roc_auc"  = "AUC-ROC",
+    "pr_auc"   = "AUC-PR",
+    "f1"       = "F1",
+    "accuracy" = "Accuracy",
+    "spec"     = "Specificity"
+  )) |>
+  select(Metric, Estimate = .estimate) |>
+  arrange(match(Metric, c(
+    "F-beta2 ★ (primary)", "Recall (Sensitivity)",
+    "AUC-ROC", "AUC-PR", "F1", "Accuracy", "Specificity"
+  ))) |>
+  knitr::kable(
+    caption  = "Final Model Performance on Hold-Out Test Set",
+    digits   = 4,
+    booktabs = TRUE
+  ) |>
+  kableExtra::kable_styling(full_width = FALSE) |>
+  kableExtra::row_spec(1, bold = TRUE, background = "#D4E6F1") |>
+  kableExtra::add_footnote(
+    "★ Primary selection criterion. AUC-PR reported alongside AUC-ROC: under class imbalance, PR curve better reflects performance on the minority (Churned) class.",
+    notation = "none"
+  )
+```
+
+```{r final-confusion}
+# ── Confusion matrix heatmap ─────────────────────────────────────────────────
+conf_mat_obj <- conf_mat(final_preds, truth = churn, estimate = .pred_class)
+
+autoplot(conf_mat_obj, type = "heatmap") +
+  scale_fill_gradient(low = "#D6EAF8", high = "#1A5276") +
+  labs(
+    title    = "Confusion Matrix - Test Set",
+    subtitle = sprintf(
+      "Accuracy: %.1f%% | Sensitivity: %.1f%%",
+      filter(final_metrics, .metric == "accuracy")$.estimate  * 100,
+      filter(final_metrics, .metric == "sens")$.estimate      * 100
+    )
+  ) +
+  theme_koru()
+```
+
+```{r final-roc}
+# ── ROC curve on test set ────────────────────────────────────────────────────
+auc_val <- filter(final_metrics, .metric == "roc_auc")$.estimate
+
+p_roc <- final_preds |>
+  roc_curve(truth = churn, .pred_Churned, event_level = "first") |>
+  autoplot() +
+  annotate("text", x = 0.72, y = 0.08,
+           label = paste0("AUC = ", round(auc_val, 3)),
+           size = 5, fontface = "bold", colour = "#E05C2A") +
+  labs(
+    title    = "ROC Curve",
+    subtitle = "Overall discriminative power across all thresholds",
+    x = "1 – Specificity (FPR)",
+    y = "Sensitivity (TPR)"
+  )
+
+# ── Precision-Recall curve ───────────────────────────────────────────────────
+# PR curve is more informative than ROC under class imbalance.
+# It shows the trade-off between catching churners (Recall) and
+# avoiding false alarms (Precision) as the decision threshold shifts.
+# A model that just predicts "all churn" would have Recall=1 but very low
+# Precision - the PR curve exposes this, whereas ROC would still look decent.
+
+pr_auc_val <- final_preds |>
+  pr_auc(truth = churn, .pred_Churned, event_level = "first") |>
+  pull(.estimate)
+
+p_pr <- final_preds |>
+  pr_curve(truth = churn, .pred_Churned, event_level = "first") |>
+  autoplot() +
+  annotate("text", x = 0.3, y = 0.15,
+           label = paste0("AUC-PR = ", round(pr_auc_val, 3)),
+           size = 5, fontface = "bold", colour = "#E05C2A") +
+  geom_hline(
+    yintercept = mean(final_preds$churn == "Churned"),
+    linetype = "dashed", colour = "grey50"
+  ) +
+  annotate("text", x = 0.95, y = mean(final_preds$churn == "Churned") + 0.03,
+           label = "Baseline", size = 3, colour = "grey50") +
+  labs(
+    title    = "Precision-Recall Curve",
+    subtitle = "Dashed line = no-skill baseline (random classifier)",
+    x = "Recall (Sensitivity)",
+    y = "Precision"
+  )
+
+p_roc | p_pr
+```
+
+---
+
+## 4. Model Interpretability
+
+### 4.1 Variable Importance
+
+`weeks_since_last_charge` emerges as the most important predictor, followed by `satisfaction_survey` and `avg_wait_minutes`. The engineered `fault_wait_index` also ranks within the top features, validating the interaction term.
+
+```{r variable-importance}
+# ── Gain-based variable importance from the final fitted model ────────────────
+# vip::vip() handles XGBoost, LightGBM, and Logistic Regression uniformly
+vip::vip(
+  extract_fit_parsnip(final_fit),
+  num_features = 20,
+  aesthetics   = list(fill = "#2A7FBE", alpha = 0.85)
+) +
+  labs(
+    title    = "Variable Importance - Top 20 Features",
+    subtitle = "Gain-based importance (tree models) | |coefficient| (Logistic Regression)"
+  )
+```
+
+### 4.2 SHAP Values
+
+Each point represents one customer. Red indicates a high feature value, blue indicates low. The direction of spread shows whether higher values increase or decrease churn risk - for example, high `weeks_since_last_charge` pushes strongly toward churn, while high `charging_sessions_12w` pushes toward retention.
+
+```{r shap}
+#| eval: !expr best_model_name == "xgb"
+#| fig-height: 6
+
+# ── SHAP: how each feature pushes individual predictions ─────────────────────
+# Computed on a 2,000-row sample of the test set for speed.
+# Each point = one customer; colour = feature value (red=high, blue=low).
+library(SHAPforxgboost)
+
+prepped_recipe <- koru_recipe |> prep()
+test_baked <- bake(prepped_recipe, new_data = test_data) |>
+  select(-churn) |>
+  as.matrix()
+
+final_engine <- extract_fit_engine(extract_fit_parsnip(final_fit))
+
+sample_idx <- sample(nrow(test_baked), min(2000, nrow(test_baked)))
+shap_vals  <- SHAPforxgboost::shap.values(
+  xgb_model = final_engine,
+  X_train   = test_baked[sample_idx, ]
+)
+
+shap_long <- SHAPforxgboost::shap.prep(
+  shap_contrib = shap_vals$shap_score,
+  X_train      = test_baked[sample_idx, ],
+  top_n        = 12
+)
+
+SHAPforxgboost::shap.plot.summary(shap_long) +
+  labs(
+    title    = "SHAP Summary Plot",
+    subtitle = "Each dot = one customer | red = high feature value, blue = low"
+  )
+```
+
+### 4.3 Logistic Regression Odds Ratios
+
+Logistic Regression is fit regardless of which model wins, as it provides interpretable coefficients for business stakeholders. An odds ratio below 1 indicates higher churn risk; above 1 indicates association with retention. `weeks_since_last_charge` and `payment_failure_last4w` show the strongest negative ORs, consistent with their variable importance rankings.
+
+```{r odds-ratios}
+# ── Odds ratio plot from logistic regression ─────────────────────────────────
+# Fit LR regardless of best model choice - provides interpretable coefficients
+lr_final <- lr_wf |> fit(data = train_data)
+
+lr_coefs <- lr_final |>
+  extract_fit_parsnip() |>
+  broom::tidy(exponentiate = TRUE, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  arrange(estimate) |>
+  # Flag direction: OR > 1 favours Retained (reduces churn risk)
+  mutate(direction = if_else(estimate > 1, "Reduces churn", "Increases churn"))
+
+# Show top 15 most extreme predictors
+lr_coefs |>
+  slice(c(1:8, (n()-7):n())) |>
+  ggplot(aes(x = reorder(term, estimate), y = estimate, colour = direction)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.3) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Reduces churn" = "#2A7FBE",
+                                  "Increases churn" = "#E05C2A"),
+                      name = NULL) +
+  coord_flip() +
+  labs(
+    title    = "Logistic Regression - Odds Ratios (Top 15)",
+    subtitle = "OR > 1: predictor associated with retention | OR < 1: associated with churn\nPredictors standardised (1 SD change)",
+    x = NULL, y = "Odds Ratio (exp(β))"
+  )
+```
+
+---
+
+## 5. Key Findings & Business Recommendations
+
+```{r findings-table}
+# ── Summary table: finding → evidence → action ───────────────────────────────
+findings <- tribble(
+  ~`#`, ~Finding,                        ~Evidence,                                   ~Recommended_Action,
+  1,   "Inactivity is the #1 signal",    "weeks_since_last_charge: top VIP, OR ≈ 0.11 per SD", 
+       "Auto-trigger re-engagement flow at 6 weeks inactivity (bonus kWh, charger update push)",
+  2,   "Satisfaction score predicts churn", "Score 1 → 70% churn; non-responders (0) → 29%", 
+       "Tiered response: score 1–2 = 48h service recovery; score 0 = 7d gentle check-in",
+  3,   "Payment failure doubles churn risk", "63.5% churn rate when payment fails (vs 27.9%)", 
+       "24h automated billing rescue: SMS retry link, 48h grace period, alternative methods",
+  4,   "Fault + wait = compounding risk",  "High fault × long wait nearly 2× single-factor churn", 
+       "Prioritise 'dual-pain' stations (fault AND wait >75th pct) for immediate maintenance",
+  5,   "Basic plan customers most at risk", "Churn rate highest in Basic tier",                  
+       "Offer upgrade incentives or loyalty perks for at-risk Basic plan members"
+)
+
+knitr::kable(findings, booktabs = TRUE,
+             caption = "Key Findings and Retention Recommendations") |>
+  kableExtra::kable_styling(full_width = TRUE, bootstrap_options = "striped") |>
+  kableExtra::column_spec(2, bold = TRUE) |>
+  kableExtra::column_spec(4, italic = TRUE)
+```
+
+These findings are supported by both EDA patterns and model-based importance measures from the selected final model.
+
+### Illustrative Business Impact
+
+Because the dataset does not contain direct revenue or lifetime value variables, the following estimate is illustrative only and based on explicit assumptions rather than observed financial data. Suppose **1,000 customers** experience a payment failure each month, their observed churn rate is **63.5%**, average customer lifetime value is **NZD 200**, and a 24-hour billing rescue workflow reduces churn by **10 percentage points**. Under this scenario, the intervention would retain approximately **100 additional customers per month**, equivalent to around **NZD 20,000** in preserved customer value.
+
+This type of estimate helps translate model outputs into business value, showing how targeted operational interventions can support both customer retention and revenue protection.
+
+---
+
+## 6. Conclusion
+
+This project develops an end-to-end churn prediction pipeline for the fictional EV charging network KoruCharge, combining exploratory analysis, feature engineering, and machine learning model comparison. Engineered variables including `fault_wait_index`, `crash_per_session`, and `recency_bucket` were introduced to capture compounding behavioural and operational risk signals identified during EDA.
+
+The best-performing model was selected automatically from Logistic Regression, XGBoost, and LightGBM using cross-validated F-beta (β = 2), which prioritises recall under asymmetric churn intervention costs. **XGBoost** was selected as the final model, achieving the strongest balance between identifying likely churners and maintaining acceptable precision. Final evaluation on the held-out test set confirmed strong overall performance, with high **Recall (0.8935)**, **AUC-ROC (0.9663)**, and **AUC-PR (0.9318)**, indicating that churn is highly predictable from customer behaviour, service experience, and payment-related signals.
+
+The results show that churn at KoruCharge is driven most strongly by inactivity, low satisfaction, payment failure, and compounded service friction such as high wait times combined with charger faults. These findings suggest that the greatest business value will come not from generic retention campaigns, but from targeted operational and behavioural interventions.
+
+Three high-leverage actions are recommended:
+
+- **Re-engagement automation** - identify drifting customers before they become fully inactive and trigger timely outreach
+- **Billing rescue workflows** - respond immediately to payment failures through automated recovery actions and short grace-period options
+- **Service recovery prioritisation** - focus maintenance and capacity improvement on stations where long waits and charger faults occur together
+
+Together, these results show how a predictive churn model can be translated into operational decisions that are both targeted and financially meaningful.
+
+---
+
+*Analysis by Shinyeong Kim | University of Auckland - BUSINFO 704 | Data: synthetic KoruCharge dataset*
