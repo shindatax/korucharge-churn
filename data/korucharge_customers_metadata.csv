@@ -1,0 +1,26 @@
+variable,description
+user_ID,Synthetic customer identifier
+age,Customer age in years
+gender,Self reported gender category
+region,NZ region associated with the member
+plan_tier,Membership plan tier
+payment_type,Primary payment method
+device_os,OS of last app login
+app_version_lag_weeks,Weeks behind latest app version
+notification_opt_in,Whether push notifications are enabled
+email_opened_last,Whether the last email campaign was opened
+app_crashes_30d,Count of app crashes in the last 30 days
+weeks_since_signup,Weeks since membership start (string with units)
+home_charging_access,Whether the member likely has access to home charging
+charging_sessions_12w,Charging sessions completed in the last 12 weeks
+avg_kwh_per_session,Average energy delivered per session (string with units)
+peak_share,Share of sessions at peak times (string with percent)
+charger_fault_rate,Fault rate near the member's typical locations (string with percent)
+avg_wait_minutes,Average wait time before charging starts (string with units)
+support_ticket,Support contact recency
+satisfaction_survey,Post service survey rating (1 to 5) or NoResponse
+refund_request_last12w,Whether a refund was requested in the last 12 weeks
+price_change_exposed,Whether the member was exposed to a plan price change
+payment_failure_last4w,Whether a payment failed in the last 4 weeks
+weeks_since_last_charge,Weeks since last completed charging session (string with units)
+retained_binary,Target label: 1 retained, 0 churned
